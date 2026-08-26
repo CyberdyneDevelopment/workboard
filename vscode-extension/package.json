@@ -1,0 +1,149 @@
+{
+  "name": "workboard",
+  "displayName": "Workboard",
+  "description": "Live view of a .workboard/ coordination board \u2014 items, notes, questions, dependency map, sessions and worktrees \u2014 with clickable file locations. Reads the board data directly and refreshes when it changes.",
+  "version": "0.1.0",
+  "publisher": "cyberdine",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "workboard.open",
+        "title": "Workboard: Open board",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "workboard.refresh",
+        "title": "Workboard: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "workboard.rebuild",
+        "title": "Workboard: Rebuild HTML page (run build.py)"
+      },
+      {
+        "command": "workboard.selectBoard",
+        "title": "Workboard: Switch board",
+        "icon": "$(replace-all)"
+      },
+      {
+        "command": "workboard.openPage",
+        "title": "Workboard: Open full page (auto-refreshing)",
+        "icon": "$(browser)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "workboard",
+          "title": "Workboard",
+          "icon": "media/board.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "workboardPanel",
+          "title": "Workboard Questions",
+          "icon": "media/board.svg"
+        }
+      ]
+    },
+    "views": {
+      "workboard": [
+        {
+          "id": "workboard.map",
+          "name": "Map",
+          "type": "webview"
+        },
+        {
+          "id": "workboard.sessions",
+          "name": "Sessions",
+          "type": "webview"
+        },
+        {
+          "id": "workboard.worktrees",
+          "name": "Worktrees",
+          "type": "webview"
+        }
+      ],
+      "workboardPanel": [
+        {
+          "id": "workboard.questions",
+          "name": "Questions",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "workboard.refresh",
+          "when": "view == workboard.questions",
+          "group": "navigation"
+        },
+        {
+          "command": "workboard.open",
+          "when": "view == workboard.questions",
+          "group": "navigation"
+        },
+        {
+          "command": "workboard.selectBoard",
+          "when": "view == workboard.map",
+          "group": "navigation"
+        },
+        {
+          "command": "workboard.refresh",
+          "when": "view == workboard.map",
+          "group": "navigation"
+        },
+        {
+          "command": "workboard.openPage",
+          "when": "view == workboard.map",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Workboard",
+      "properties": {
+        "workboard.boardPath": {
+          "type": "string",
+          "default": "",
+          "description": "Folder containing the .workboard directory to show. Empty = pick automatically (or ask when several exist)."
+        },
+        "workboard.autoRebuild": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the board's build.py automatically whenever items.json or notes.jsonl changes, so WORKBOARD.html stays current too. The extension itself does not need this \u2014 it reads the data directly."
+        },
+        "workboard.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Interpreter used for build.py and the worktree-gate status call."
+        },
+        "workboard.repoAliases": {
+          "type": "object",
+          "default": {
+            "FDW": "fractaldataworks",
+            "fdw": "fractaldataworks"
+          },
+          "description": "Maps a `repo ::` prefix used in board evidence to the actual repo directory name. Unmatched hints fall back to a fuzzy match across all repos, then a workspace search.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

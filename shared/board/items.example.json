@@ -1,0 +1,77 @@
+{
+ "title": "Example Board",
+ "subtitle": "What is open, the evidence, who holds it, and what they have found.",
+ "groups": [
+  {
+   "name": "Live defects",
+   "blurb": "Bugs on the books now. Optional one-line framing for the group.",
+   "items": [
+    {
+     "id": "swallowed-factory-failure",
+     "title": "Failed registration is reported as success",
+     "status": "open",
+     "sev": "live",
+     "why": "Consequence in the running system \u2014 not a restatement of the title.",
+     "evidence": [
+      "myrepo :: Project/Thing.cs:78",
+      "correct form: Project/Sibling.cs:92"
+     ],
+     "repo": "myrepo",
+     "fix": "return result.ToNewResult<IHost>();",
+     "expected": [
+      "change  myrepo/src/Project/Thing.cs"
+     ],
+     "actual": [],
+     "owner": "session: worker-1",
+     "links": {
+      "gates": [
+       "downstream-item"
+      ],
+      "needs": [],
+      "related": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "Blocked",
+   "items": [
+    {
+     "id": "downstream-item",
+     "title": "Waits on the one above",
+     "status": "blocked",
+     "sev": "medium",
+     "why": "Named so the map has a second node to draw an edge to.",
+     "links": {
+      "needs": [
+       "swallowed-factory-failure"
+      ]
+     }
+    }
+   ]
+  }
+ ],
+ "sessions": [
+  {
+   "name": "worker-1",
+   "ref": "abc123",
+   "role": "Mechanical file edits from a fully-specified brief.",
+   "holds": "swallowed-factory-failure"
+  }
+ ],
+ "questions": [
+  {
+   "q": "A decision only the human can make?",
+   "why": "Why it cannot be settled by evidence.",
+   "options": [
+    "YES - what happens then",
+    "NO - what happens instead"
+   ],
+   "rec": "YES",
+   "blocks": [
+    "swallowed-factory-failure"
+   ],
+   "who": "who acts once answered"
+  }
+ ]
+}
