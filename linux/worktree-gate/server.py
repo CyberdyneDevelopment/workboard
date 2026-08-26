@@ -54,6 +54,10 @@ TOOLS = [
           "task": {"type": "string", "description":
                    "Task name. Branch is feature/<task>; worktree is <task>-<repo> unless "
                    "'worktree' overrides it. Use the SAME task name across repos for one cycle."},
+          "base": {"type": "string", "description":
+                   "Ref to cut from — a branch, tag or sha. Defaults to the main checkout's "
+                   "local HEAD. Pass it to branch off another session's feature branch; the "
+                   "main checkout's working tree is then irrelevant and is not checked."},
           "worktree": {"type": "string", "description":
                        "Optional worktree directory name. Defaults to <task>-<repo>."}},
          ["repo", "task"]),
@@ -197,23 +201,42 @@ def op_create(a):
     name = a.get("worktree") or f"{task}-{repo}"
     scope = L.scope_of(os.path.join(L.WORKSPACE, repo))
     main = L.repo_path(repo, scope)
-    if not L.is_clean(main):
-        raise L.GateError(
-            f"{repo} main checkout has uncommitted changes. Stop and ask — never stash or "
-            f"discard in-progress work to make room for a worktree.")
-    base = L.current_branch(main)
+
+    # An explicit base makes the main checkout's working tree irrelevant: the new worktree is
+    # built from that ref, not from main's HEAD, so uncommitted work there cannot leak in or be
+    # lost. Refusing anyway would block a documented case -- a dependent agent branching off its
+    # prerequisite's branch -- for a reason that does not apply to it.
+    base = (a.get("base") or "").strip()
+    if not base:
+        if not L.is_clean(main):
+            raise L.GateError(
+                f"{repo} main checkout has uncommitted changes. Stop and ask — never stash or "
+                f"discard in-progress work to make room for a worktree.\n"
+                f"If you meant to cut from a specific ref rather than main's HEAD, pass "
+                f"base=<ref> and main's state stops mattering.")
+        base = L.current_branch(main)
+        start = "HEAD"
+    else:
+        # Fail loud on an unknown ref rather than letting git create something surprising.
+        if not L.git(["rev-parse", "--verify", "--quiet", base + "^{commit}"], main, check=False).strip():
+            raise L.GateError(
+                f"{base!r} is not a ref in {repo}. Local branches: "
+                + ", ".join(L.git(["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                                  main, check=False).split()[:20]))
+        start = base
     # Why the workspace root and not the repo: one place to look, one place to prune.
     # A worktree under <repo>/.worktrees is invisible until you think to look there.
     path = os.path.join(L.worktree_dir_of(scope), name)
     if os.path.exists(path):
         raise L.GateError(f"{path} already exists. Prune it first, or pick another name.")
     branch = f"feature/{task}"
-    L.git(["worktree", "add", path, "-b", branch, "HEAD"], main)
+    L.git(["worktree", "add", path, "-b", branch, start], main)
     L.record("create", a["session"], a["description"], repo, name,
              branch=branch, base=base, path=path,
              head=L.git(["rev-parse", "--short", "HEAD"], main), ok=True, task=a.get("_task"), board=a.get("_board"),
              taskVerified=a.get("_verified"))
-    return (f"Cut {repo}/{name}\n  branch {branch}\n  from   {base} (local HEAD)\n"
+    return (f"Cut {repo}/{name}\n  branch {branch}\n  from   {base}"
+            f"{' (local HEAD)' if start == 'HEAD' else ' (explicit base)'}\n"
             f"  path   {path}\nRecorded as {a['session']}.")
 
 

@@ -62,7 +62,8 @@ ROOT = WORKSPACE
 LEDGER = ledger_of(WORKSPACE)
 WORKTREE_DIR = worktree_dir_of(WORKSPACE)
 
-ACTIONS = ("create", "pull", "sync", "merge", "prune", "revive", "board", "denied")
+ACTIONS = ("create", "pull", "sync", "merge", "prune", "revive", "board",
+           "commit", "denied")
 
 
 class GateError(Exception):
