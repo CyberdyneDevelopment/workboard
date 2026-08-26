@@ -160,7 +160,45 @@ An implementation must:
 4. Never assert liveness. Discovering running sessions is not something a spawned process can
    do; reviving a live expert produces two. Liveness belongs to the caller.
 
-## 9. Conformance
+## 9. Board mutation and subscription
+
+`items.json` is mutated **through the server or not at all**. A PreToolUse hook denies
+`Write`/`Edit`/`MultiEdit` on it. `notes.jsonl` is deliberately not guarded: it is append-only
+and anyone may add to it.
+
+`item_update` accepts only these fields:
+
+| settable by a worker | belongs to the orchestrating session |
+|---|---|
+| `status` `owner` `actual` `fix` `sev` | `id` `title` `why` `evidence` `links` `expected` `repo` `was` |
+
+An unknown or structural field is **refused by name**. This is what lets many sessions write to
+one board without "one writer per layer" degrading into a convention nobody enforces: structure
+still has one writer; progress has many.
+
+`<scope>/.workboard/subscriptions.jsonl` — append-only, latest state per (item, subscriber)
+wins, so a later unsubscribe cancels an earlier subscribe.
+`<scope>/.workboard/notifications.jsonl` — append-only; delivery is recorded as a second
+record, never by mutating the first.
+
+### Delivery, and its one honest limit
+
+**A server cannot interrupt a running session.** MCP is request/response; the server has no
+channel into a session's context and no way to see which sessions are alive. So delivery is
+layered, and only the first layer is guaranteed:
+
+1. **Every tool result carries what is pending for the caller.** Implemented at the single
+   dispatch point rather than per tool, so a subscriber cannot miss a notification by using a
+   tool nobody thought to instrument. A subscriber learns at its next gated call.
+2. `notifications_pending` — the same thing on demand.
+3. The `item_update` result names the subscribers and tells the caller to message them. Faster,
+   not surer.
+4. A dead subscriber is revived like an expert. The queue survives either way.
+
+An implementation must not claim a notification was delivered because it was queued, and must
+not drop one because a subscriber appears to be gone.
+
+## 10. Conformance
 
 An implementation is conformant when, against the same `.workboard/` and
 `.worktree-gate/ledger.jsonl`:

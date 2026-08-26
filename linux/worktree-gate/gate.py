@@ -53,6 +53,36 @@ Read-only git (status, log, diff, worktree list, branch --show-current) is not g
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
+# ---------------------------------------------------------------- board write guard
+
+BOARD_TARGETS = ("/.workboard/items.json", "\\.workboard\\items.json")
+
+
+def board_write_denial(payload):
+    """Deny a direct edit of items.json. The board is mutated through the MCP server or not
+    at all -- otherwise 'one writer per layer' is a convention, and a convention that is not
+    enforced is a comment.
+
+    notes.jsonl is deliberately NOT guarded: it is append-only and anyone may add to it.
+    """
+    tool = payload.get("hook_event_name") == "PreToolUse" and payload.get("tool_name")
+    if tool not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        return None
+    path = (payload.get("tool_input") or {}).get("file_path") or ""
+    if not any(t in path for t in BOARD_TARGETS):
+        return None
+    return (
+        "Blocked: the board is not edited directly.\n\n"
+        f"  {path}\n\n"
+        "Use the worktree-gate MCP server:\n"
+        "  item_update(item=..., changes={...}, session=..., description=..., task=...)\n\n"
+        "It validates the item exists, refuses fields that belong to the orchestrating\n"
+        "session, records the change in the ledger, and notifies every subscriber. A direct\n"
+        "write does none of that, and a subscriber would never learn the item moved.\n\n"
+        "Appending to .workboard/notes.jsonl is NOT gated -- notes are append-only and open."
+    )
+
+
 def strip_heredocs(command):
     """Remove heredoc bodies before scanning.
 
@@ -178,6 +208,13 @@ def main():
             record_created(payload)
         except Exception as exc:
             print(f"worktree-gate: could not record: {exc}", file=sys.stderr)
+        sys.exit(0)
+
+    denial = board_write_denial(payload)
+    if denial:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": denial}}))
         sys.exit(0)
 
     if payload.get("tool_name") != "Bash":

@@ -92,6 +92,32 @@ TOOLS = [
           "only": {"type": "array", "items": {"type": "string"},
                    "description": "Adopt just these worktree names. Omit for all in scope."}},
          []),
+    tool("item_subscribe",
+         "Subscribe this session to a board item. When anyone updates it you are notified. "
+         "Delivery is at your next worktree-gate call -- this server cannot interrupt a "
+         "running session.",
+         {"item": {"type": "string", "description": "Board item id."},
+          "scope": {"type": "string"}},
+         ["item"]),
+    tool("item_unsubscribe", "Stop being notified about a board item.",
+         {"item": {"type": "string"}, "scope": {"type": "string"}}, ["item"]),
+    tool("item_update",
+         "Change a board item and notify its subscribers. The ONLY sanctioned way to update "
+         "the board: direct edits to items.json are blocked. Settable: status, owner, actual, "
+         "fix, sev. Structure (title, why, evidence, links) belongs to the orchestrating "
+         "session and is refused here.",
+         {"item": {"type": "string"},
+          "changes": {"type": "object", "description":
+                      'e.g. {"status": "done", "actual": ["changed  path/File.cs"]}'},
+          "scope": {"type": "string"}},
+         ["item", "changes"]),
+    tool("notifications_pending",
+         "Board notifications waiting for this session. Reading them marks them delivered.",
+         {"session": {"type": "string", "description": "Your session name."},
+          "scope": {"type": "string"}},
+         ["session"], mutates=False),
+    tool("subscriptions", "Who is subscribed to what in this scope.",
+         {"scope": {"type": "string"}}, [], mutates=False),
     tool("expert_list",
          "Declared domain experts: folder, what it answers, and when it was last active. An "
          "expert is a long-lived session rooted in a domain folder, not a worktree session.",
@@ -533,6 +559,199 @@ def op_expert_revive(a):
               f"prints — not by this name if they differ.")
 
 
+# ------------------------------------------------------- board: subscribe & notify
+
+# Fields a worker session may change. Structure -- what the item IS -- stays with the
+# orchestrating session, so "one writer per layer" survives having many writers.
+WORKER_FIELDS = {"status", "owner", "actual", "fix", "sev"}
+STRUCTURE_FIELDS = {"id", "title", "why", "evidence", "links", "expected", "repo", "was"}
+
+
+def subs_path(scope):
+    return os.path.join(scope, ".workboard", "subscriptions.jsonl")
+
+
+def notif_path(scope):
+    return os.path.join(scope, ".workboard", "notifications.jsonl")
+
+
+def _read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as h:
+        for n, line in enumerate(h, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise L.GateError(f"{path} line {n} is not valid JSON: {exc}") from exc
+    return rows
+
+
+def _append_jsonl(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as h:
+        h.write(json.dumps(obj, sort_keys=True) + "\n")
+
+
+def active_subscribers(scope, item):
+    """Latest state wins: a later unsubscribe cancels an earlier subscribe."""
+    state = {}
+    for r in _read_jsonl(subs_path(scope)):
+        if r.get("item") == item:
+            state[r["subscriber"]] = r.get("active", True)
+    return sorted(k for k, v in state.items() if v)
+
+
+def find_item(scope, item_id):
+    board = board_path(scope)
+    if not os.path.exists(board):
+        raise L.GateError(f"no board at {board}")
+    data = json.load(open(board, encoding="utf-8"))
+    for g in data.get("groups", []):
+        for it in g.get("items", []):
+            if it.get("id") == item_id:
+                return data, g, it
+    raise L.GateError(f"no item {item_id!r} on the board. Open items: "
+                      + ", ".join(sorted(i["id"] for g in data.get("groups", [])
+                                         for i in g.get("items", [])
+                                         if i.get("status") != "done")[:14]))
+
+
+def op_item_subscribe(a):
+    scope = _scope_arg(a)
+    find_item(scope, a["item"])                      # refuse to subscribe to nothing
+    _append_jsonl(subs_path(scope), {
+        "ts": L.now(), "item": a["item"], "subscriber": a["session"],
+        "reason": a["description"], "active": True})
+    return (f"{a['session']} subscribed to {a['item']}.\n"
+            f"Notifications arrive in the result of your NEXT worktree-gate call — this server "
+            f"cannot interrupt a running session, so delivery is at your next tool use, not "
+            f"instant. Call notifications_pending to check on demand.")
+
+
+def op_item_unsubscribe(a):
+    scope = _scope_arg(a)
+    _append_jsonl(subs_path(scope), {
+        "ts": L.now(), "item": a["item"], "subscriber": a["session"],
+        "reason": a["description"], "active": False})
+    return f"{a['session']} unsubscribed from {a['item']}."
+
+
+def fan_out(scope, item, event, by, detail):
+    """One notification per active subscriber, minus the actor. Returns who was notified."""
+    targets = [s for s in active_subscribers(scope, item) if s != by]
+    for t in targets:
+        _append_jsonl(notif_path(scope), {
+            "ts": L.now(), "item": item, "subscriber": t, "event": event,
+            "by": by, "detail": detail, "delivered": False})
+    return targets
+
+
+def pending_for(scope, session):
+    """Undelivered notifications for one session, oldest first."""
+    delivered = {(r["ts"], r["subscriber"]) for r in _read_jsonl(notif_path(scope))
+                 if r.get("delivered")}
+    return [r for r in _read_jsonl(notif_path(scope))
+            if r.get("subscriber") == session and not r.get("delivered")
+            and (r["ts"], r["subscriber"]) not in delivered]
+
+
+def mark_delivered(scope, rows):
+    for r in rows:
+        _append_jsonl(notif_path(scope), dict(r, delivered=True, deliveredAt=L.now()))
+
+
+def deliver_banner(scope, session):
+    """Pending notifications, rendered to sit on top of a tool result.
+
+    This is the ONLY delivery channel that is guaranteed. The server cannot push into a
+    running session, so a subscriber learns at its next gated call. Everything else --
+    a message from the supervisor, a respawn -- is faster, not surer.
+    """
+    if not session:
+        return ""
+    rows = pending_for(scope, session)
+    if not rows:
+        return ""
+    mark_delivered(scope, rows)
+    out = [f"{'=' * 68}", f"{len(rows)} board notification(s) for {session}:"]
+    for r in rows:
+        out.append(f"  [{r['ts'][:16]}] {r['item']} — {r['event']} by {r['by']}")
+        if r.get("detail"):
+            out.append(f"      {r['detail']}")
+    out.append("=" * 68)
+    return "\n".join(out) + "\n\n"
+
+
+def op_item_update(a):
+    scope = _scope_arg(a)
+    data, group, item = find_item(scope, a["item"])
+    changes = a.get("changes") or {}
+    if not changes:
+        raise L.GateError("changes is empty. Say what you are changing.")
+    bad = set(changes) - WORKER_FIELDS
+    if bad:
+        why = ("structure belongs to the orchestrating session"
+               if bad & STRUCTURE_FIELDS else "not a known item field")
+        raise L.GateError(f"cannot set {', '.join(sorted(bad))} — {why}. "
+                          f"Settable here: {', '.join(sorted(WORKER_FIELDS))}.")
+
+    before = {k: item.get(k) for k in changes}
+    item.update(changes)
+    board = board_path(scope)
+    tmp = board + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as h:
+        json.dump(data, h, indent=1)
+    os.replace(tmp, board)                      # atomic: a reader never sees a half-written board
+
+    detail = "; ".join(f"{k}: {before[k]!r} -> {v!r}" for k, v in changes.items())
+    L.record("board", a["session"], a["description"], None, None,
+             item=a["item"], changes=list(changes), ok=True)
+    notified = fan_out(scope, a["item"], "updated", a["session"], detail)
+
+    out = [f"{a['item']} updated: {detail}"]
+    if notified:
+        out.append(f"\n{len(notified)} subscriber(s) queued: {', '.join(notified)}")
+        out.append("They receive it at their next worktree-gate call. To reach them sooner:")
+        out.append('  ToolSearch("select:ListAgents,SendMessage") then message each by its'
+                   " ListAgents row name.")
+        out.append("If one is not listed there it is dead — expert_revive it, or leave it: the"
+                   " notification is queued and survives.")
+    else:
+        out.append("No subscribers.")
+    return "\n".join(out)
+
+
+def op_notifications_pending(a):
+    scope = _scope_arg(a)
+    rows = pending_for(scope, a.get("session") or "")
+    if not rows:
+        return f"Nothing pending for {a.get('session')!r}."
+    mark_delivered(scope, rows)
+    return "\n".join([f"{len(rows)} notification(s):"]
+                      + [f"  [{r['ts'][:16]}] {r['item']} — {r['event']} by {r['by']}"
+                         + (f"\n      {r['detail']}" if r.get("detail") else "")
+                         for r in rows])
+
+
+def op_subscriptions(a):
+    scope = _scope_arg(a)
+    rows = _read_jsonl(subs_path(scope))
+    if not rows:
+        return "No subscriptions in this scope."
+    items = sorted({r["item"] for r in rows})
+    out = []
+    for it in items:
+        subs = active_subscribers(scope, it)
+        if subs:
+            out.append(f"  {it}: {', '.join(subs)}")
+    return "\n".join(["Active subscriptions:"] + out) if out else "No active subscriptions."
+
+
 def board_path(scope):
     return os.path.join(scope, ".workboard", "items.json")
 
@@ -909,11 +1128,14 @@ def op_history(a):
         f"  {r['session']}\n      {r['description']}" for r in rows)
 
 
-OPS = {"expert_list": op_expert_list, "expert_revive": op_expert_revive,
+OPS = {"item_subscribe": op_item_subscribe, "item_unsubscribe": op_item_unsubscribe,
+       "item_update": op_item_update, "notifications_pending": op_notifications_pending,
+       "subscriptions": op_subscriptions,
+       "expert_list": op_expert_list, "expert_revive": op_expert_revive,
        "doc_review_list": op_doc_review_list, "doc_review_resolve": op_doc_review_resolve,
        "worktree_sync": op_sync, "worktree_adopt": op_adopt, "worktree_create": op_create, "worktree_pull": op_pull, "worktree_merge": op_merge,
        "worktree_prune": op_prune, "worktree_status": op_status, "worktree_history": op_history}
-MUTATING = {"expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
+MUTATING = {"item_subscribe", "item_unsubscribe", "item_update", "expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
 
 
 def require_who(name, args):
@@ -930,10 +1152,15 @@ def require_who(name, args):
             raise L.GateError(
                 f"{field} is required before {name} will touch anything — "
                 f"say who is acting, why, and which task this belongs to.")
-    scope = L.scope_of(os.path.join(L.WORKSPACE, args["repo"])) if args.get("repo") else L.WORKSPACE
+    # Why _scope_arg and not a repo-only derivation: a caller working in a sub-scope passes
+    # `scope` and often no `repo` at all. Deriving from repo alone silently validated the task
+    # against the WORKSPACE board instead of the sub-scope's, so a legitimate task in a nested
+    # scope was refused while naming items from a board the caller was not using.
+    scope = _scope_arg(args)
     task, board, verified = resolve_task(scope, args["task"])
     args["_task"], args["_verified"] = task, verified
     args["_board"] = os.path.relpath(board, L.WORKSPACE) if board else None
+    args["_scope"] = scope
 
 
 # ------------------------------------------------------------------ jsonrpc
@@ -970,6 +1197,11 @@ def handle(msg):
                 raise L.GateError(f"unknown tool {name!r}")
             require_who(name, args)
             text, is_error = OPS[name](args), False
+            # Why here and not in each op: this is the one place every call passes through,
+            # so a subscriber cannot miss a notification by using a tool nobody thought to
+            # instrument. The server cannot push -- this is the guaranteed channel.
+            if name != "notifications_pending":
+                text = deliver_banner(_scope_arg(args), args.get("session") or "") + text
         except L.GateError as exc:
             text, is_error = f"REFUSED: {exc}", True
         except Exception as exc:  # noqa: BLE001 - surface, never swallow
@@ -1014,7 +1246,10 @@ def cli(argv):
         if name not in OPS:
             raise L.GateError(f"unknown tool {name!r}; tools: {', '.join(OPS)}")
         require_who(name, args)
-        print(OPS[name](args))
+        out = OPS[name](args)
+        if name != "notifications_pending":
+            out = deliver_banner(_scope_arg(args), args.get("session") or "") + out
+        print(out)
         return 0
     except L.GateError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
