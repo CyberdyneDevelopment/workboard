@@ -8,9 +8,11 @@ ledger with who did it and why, before it is reported as done. Raw `git worktree
 
 stdout carries JSON-RPC only. Everything else goes to stderr.
 """
+import functools
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -92,6 +94,33 @@ TOOLS = [
           "only": {"type": "array", "items": {"type": "string"},
                    "description": "Adopt just these worktree names. Omit for all in scope."}},
          []),
+    tool("worktree_commit",
+         "Commit inside a worktree. The only sanctioned path: raw `git commit` is blocked. "
+         "Records the commit and notifies everyone subscribed to its task. Staging is "
+         "explicit -- pass paths to stage those, or all=true for everything; it will not "
+         "guess.",
+         {"repo": {"type": "string"}, "worktree": {"type": "string"},
+          "message": {"type": "string", "description": "Commit message. Required."},
+          "paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Stage exactly these before committing."},
+          "all": {"type": "boolean", "description": "Stage everything in the worktree."},
+          "scope": {"type": "string"}},
+         ["repo", "worktree", "message"]),
+    tool("notification_relayed",
+         "Mark a subscriber's notification as delivered because it was relayed to them. Used "
+         "by the board notifier; do not mark one you did not actually deliver.",
+         {"item": {"type": "string"}, "subscriber": {"type": "string"},
+          "scope": {"type": "string"}},
+         ["item", "subscriber"]),
+    tool("route_preview",
+         "Which documentation project would own a change, without merging anything. Names the "
+         "projects that matched, the one precedence chose, and any project with no "
+         "coverage.json.",
+         {"repo": {"type": "string"},
+          "paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Repo-relative changed paths."},
+          "scope": {"type": "string"}},
+         ["repo"], mutates=False),
     tool("item_subscribe",
          "Subscribe this session to a board item. When anyone updates it you are notified. "
          "Delivery is at your next worktree-gate call -- this server cannot interrupt a "
@@ -304,6 +333,129 @@ DOC_REVIEWERS_DEFAULT = {"default": {"agent": "fdw-anatomy-maintainer",
                                      "cwd": "fdw-anatomy", "spawn": True,
                                      "permissionMode": "acceptEdits",
                                      "model": "sonnet"}}
+
+
+@functools.lru_cache(maxsize=512)
+def _glob_re(pattern):
+    """Translate a path glob to a regex.
+
+    fnmatch is unusable here: its `*` crosses `/`, so `public/src/*` would match every file at
+    any depth. And the obvious shortcut -- treat everything before `**` as a prefix -- is worse
+    than useless for a LEADING `**`: the prefix is empty, so `**/obj/**` matched every path and
+    every ignore rule silently ignored everything.
+
+      **/   zero or more directories        **   anything, separators included
+      *     anything except a separator     ?    one character except a separator
+    """
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*"); i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*"); i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]"); i += 1
+        else:
+            out.append(re.escape(pattern[i])); i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _glob_match(path, pattern):
+    return _glob_re(pattern).match(path) is not None
+
+
+def coverage_declarations(scope):
+    """Every documentation project's coverage.json, plus the ones that have none.
+
+    A project without coverage.json is UNROUTABLE and is named on every run. Silently
+    skipping it would make a missing declaration look like a project that simply never
+    matches, which is the same symptom as a wrong declaration and impossible to tell apart.
+    """
+    docs = os.path.join(scope, "docs")
+    if not os.path.isdir(docs):
+        return [], []
+    declared, undeclared = [], []
+    for name in sorted(os.listdir(docs)):
+        d = os.path.join(docs, name)
+        if not os.path.isdir(d):
+            continue
+        path = os.path.join(d, "coverage.json")
+        if not os.path.exists(path):
+            undeclared.append(name)
+            continue
+        try:
+            cov = json.load(open(path, encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise L.GateError(f"{path} is not valid JSON: {exc}") from exc
+        for field in ("project", "agent"):
+            if field not in cov:
+                raise L.GateError(f"{path} has no {field!r}.")
+        cov["dir"] = os.path.join("docs", name)
+        declared.append(cov)
+    return declared, undeclared
+
+
+def route_change(scope, repo, changed_paths):
+    """Pick the documentation project that owns these changed paths.
+
+    Returns (chosen, matched, undeclared). `chosen` is None when nothing covers the change --
+    that is a finding, not a default: a subsystem no document covers is exactly the case you
+    most need to see, and sending it to a fallback project hides it.
+    """
+    declared, undeclared = coverage_declarations(scope)
+    matched = []
+    for cov in declared:
+        ignores = cov.get("ignores") or []
+        for entry in cov.get("covers") or []:
+            if entry.get("repo") != repo:
+                continue
+            for path in changed_paths:
+                if any(_glob_match(path, ig) for ig in ignores):
+                    continue
+                if any(_glob_match(path, pat) for pat in entry.get("paths") or ["**"]):
+                    matched.append(cov)
+                    break
+            if cov in matched:
+                break
+    if not matched:
+        return None, [], undeclared
+    # Highest precedence wins; ties broken by name so the same change always routes the same way.
+    matched.sort(key=lambda c: (-int(c.get("precedence", 0)), c["project"]))
+    return matched[0], matched, undeclared
+
+
+def record_unrouted(scope, payload):
+    """A change nothing claims. Append-only, and never silently dropped."""
+    path = os.path.join(scope, "docs", "_unrouted.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as h:
+        h.write(json.dumps(payload, sort_keys=True) + "\n")
+    return path
+
+
+def op_route_preview(a):
+    """What would route where, without merging anything."""
+    scope = _scope_arg(a)
+    paths = a.get("paths") or []
+    chosen, matched, undeclared = route_change(scope, a["repo"], paths)
+    out = []
+    if undeclared:
+        out.append(f"UNROUTABLE (no coverage.json): {', '.join(undeclared)}")
+        out.append("")
+    if chosen:
+        out.append(f"routes to: {chosen['project']}  (agent {chosen['agent']}, "
+                   f"precedence {chosen.get('precedence', 0)})")
+        if len(matched) > 1:
+            out.append("also matched, lower precedence: "
+                       + ", ".join(f"{c['project']}({c.get('precedence', 0)})" for c in matched[1:]))
+    else:
+        declared, _ = coverage_declarations(scope)
+        out.append("NOTHING COVERS THIS — it would be queued in docs/_unrouted.jsonl.")
+        out.append(f"{len(declared)} project(s) declare coverage; none claims "
+                   f"{a['repo']} at these paths.")
+    return "\n".join(out)
 
 
 def doc_reviewers(scope):
@@ -687,6 +839,72 @@ def deliver_banner(scope, session):
     return "\n".join(out) + "\n\n"
 
 
+def spawn_notifier(scope, item, detail, targets, by):
+    """Start a cheap headless session whose only job is to relay board notifications.
+
+    This is what makes the notification actually PUSH. The server cannot message a running
+    session -- but a session can, so the server starts one. Haiku because the work is
+    mechanical: read the queue, look up who is alive, relay, mark relayed. No judgement is
+    being exercised and nothing is being written to the codebase.
+
+    Detached and never blocking. If it fails the queue is untouched, and every subscriber
+    still collects at its next gated call -- the notifier makes delivery FASTER, never surer.
+    """
+    if os.environ.get("WORKTREE_GATE_NO_SPAWN"):
+        return "  notifier suppressed (WORKTREE_GATE_NO_SPAWN set)."
+    # A notifier that updated the board would spawn a notifier.
+    if os.environ.get("WORKTREE_GATE_DEPTH"):
+        return "  notifier skipped — already inside a spawned session (recursion guard)."
+
+    prompt = f"""You are a board notifier. Relay one change to the sessions watching it, then stop.
+Do not do any other work. Do not edit code. Do not touch the board.
+
+WHAT CHANGED
+  item    {item}
+  change  {detail}
+  by      {by}
+  watching: {', '.join(targets)}
+
+WHAT TO DO
+1. Load the tools:  ToolSearch("select:ListAgents,SendMessage")
+2. ListAgents. For each session named above, find its row. Match on the row NAME.
+3. Message each one that IS listed, briefly and concretely:
+     "{item} changed: {detail} (by {by}). You subscribed to it."
+   Say what changed. Do not summarise it away, and do not add advice.
+4. For each one you actually messaged, mark it relayed so it is not delivered twice:
+     mcp__worktree-gate__notification_relayed(item="{item}", subscriber="<name>",
+       session="board-notifier", description="relayed to a live session")
+5. A session NOT in ListAgents is not running. Leave it alone and do NOT mark it relayed --
+   its notification stays queued and it will collect at its next gate call. Reviving it is
+   not your decision.
+
+Then stop. Report in one line who you reached and who you did not."""
+
+    log = os.path.join(scope, ".worktree-gate", "notifier.log")
+    env = dict(os.environ, WORKTREE_GATE_DEPTH="1")
+    try:
+        with open(log, "a", encoding="utf-8") as h:
+            h.write(f"\n===== {L.now()} notify {item} -> {', '.join(targets)}\n")
+            subprocess.Popen(["claude", "-p", prompt, "--model", "haiku",
+                              "--permission-mode", "acceptEdits"],
+                             cwd=scope, stdin=subprocess.DEVNULL, stdout=h,
+                             stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    except Exception as exc:  # noqa: BLE001 - the queue is the durable record
+        return f"  NOTIFIER FAILED TO START: {exc}. Subscribers collect at their next gate call."
+    return ("  Notifier started (haiku) — it will ListAgents and message whoever is live.\n"
+            "  Anyone it cannot reach stays queued and collects at their next gate call.")
+
+
+def op_notification_relayed(a):
+    """Mark one subscriber's notification for an item as delivered, because it was relayed."""
+    scope = _scope_arg(a)
+    rows = [r for r in pending_for(scope, a["subscriber"]) if r.get("item") == a["item"]]
+    if not rows:
+        return f"nothing pending for {a['subscriber']} on {a['item']} — already delivered."
+    mark_delivered(scope, rows)
+    return f"{len(rows)} notification(s) for {a['subscriber']} on {a['item']} marked relayed."
+
+
 def op_item_update(a):
     scope = _scope_arg(a)
     data, group, item = find_item(scope, a["item"])
@@ -716,11 +934,7 @@ def op_item_update(a):
     out = [f"{a['item']} updated: {detail}"]
     if notified:
         out.append(f"\n{len(notified)} subscriber(s) queued: {', '.join(notified)}")
-        out.append("They receive it at their next worktree-gate call. To reach them sooner:")
-        out.append('  ToolSearch("select:ListAgents,SendMessage") then message each by its'
-                   " ListAgents row name.")
-        out.append("If one is not listed there it is dead — expert_revive it, or leave it: the"
-                   " notification is queued and survives.")
+        out.append(spawn_notifier(scope, a["item"], detail, notified, a["session"]))
     else:
         out.append("No subscribers.")
     return "\n".join(out)
@@ -809,7 +1023,31 @@ def file_doc_review(scope, repo, worktree, branch, into, subjects, changed,
         routing = doc_reviewers(scope)
     except L.GateError as exc:
         return f"DOC REVIEW NOT FILED: {exc}"
+    # .registrar.json may name the project outright; otherwise the router decides from the
+    # coverage declarations. An unrouted change is queued as a finding, never sent to a default.
+    routed = None
+    if not (doccfg or {}).get("project"):
+        paths = [ln.split("|")[0].strip() for ln in (changed or "").splitlines()
+                 if "|" in ln]
+        routed, matched, undeclared = route_change(scope, repo, paths)
+        if routed is None:
+            where = record_unrouted(scope, {
+                "ts": L.now(), "repo": repo, "worktree": worktree, "branch": branch,
+                "sha": sha, "task": task, "mergedBy": session, "paths": paths[:40],
+                "declared": len(coverage_declarations(scope)[0]),
+                "undeclared": undeclared})
+            return (f"NO DOCUMENTATION PROJECT COVERS THIS CHANGE.\n"
+                    f"  queued in {os.path.relpath(where, L.WORKSPACE)}\n"
+                    + (f"  projects with no coverage.json: {', '.join(undeclared)}\n"
+                       if undeclared else "")
+                    + "  A subsystem no document covers is a finding, not a default. Give a "
+                      "documentation\n  project a coverage.json entry for it, or accept that "
+                      "it is undocumented.")
     route = dict(routing.get(repo, routing["default"]))
+    if routed:
+        route.update({k: v for k, v in (("agent", routed.get("agent")),
+                                        ("model", routed.get("model")),
+                                        ("cwd", routed.get("dir"))) if v})
     # .registrar.json wins over reviewers.json: it is the project's own declaration.
     for k, v in (doccfg or {}).items():
         if k == "project":
@@ -991,6 +1229,59 @@ def op_doc_review_resolve(a):
     return f"{a['id']} resolved by {a['session']}: {a['description']}"
 
 
+def op_commit(a):
+    """Commit inside a worktree, record it, and tell whoever is watching the item.
+
+    Why commits are gated at all: a commit is the finest-grained signal that work moved, and
+    it was previously invisible -- nothing watched worktree HEADs, so a subscriber learned
+    only when someone flipped a status. Routing commits through here makes the signal exact
+    rather than inferred, at the cost of real friction on the most frequent git operation.
+    """
+    scope = _scope_arg(a)
+    repo, name = a["repo"], a["worktree"]
+    found = L.find_worktree(repo, name, scope)
+    if not found:
+        raise L.GateError(f"no worktree {name!r} for {repo} in this scope. "
+                          f"worktree_status lists what exists.")
+    path = found["path"]
+    message = (a.get("message") or "").strip()
+    if not message:
+        raise L.GateError("message is required. A commit nobody can read is a commit nobody "
+                          "can review.")
+
+    # Staging is explicit. Guessing between "everything" and "what is staged" silently
+    # commits the wrong set, and the wrong set is only discovered after the push.
+    if a.get("paths"):
+        L.git(["add", "--"] + list(a["paths"]), path)
+    elif a.get("all"):
+        L.git(["add", "-A"], path)
+    if not L.git(["diff", "--cached", "--name-only"], path, check=False).strip():
+        raise L.GateError(
+            "nothing staged. Pass paths=[...] to stage those, or all=true to stage everything "
+            "in the worktree. Refusing to guess which you meant.")
+
+    staged = L.git(["diff", "--cached", "--name-only"], path, check=False).splitlines()
+    L.git(["commit", "-m", message], path)
+    sha = L.git(["rev-parse", "--short", "HEAD"], path, check=False).strip()
+    branch = L.git(["rev-parse", "--abbrev-ref", "HEAD"], path, check=False).strip()
+
+    L.record("commit", a["session"], a["description"], repo, name,
+             sha=sha, branch=branch, files=len(staged), subject=message.splitlines()[0],
+             task=a.get("_task"), board=a.get("_board"), ok=True)
+
+    out = [f"{sha} on {branch} in {repo}/{name} — {len(staged)} file(s)",
+           f"  {message.splitlines()[0]}"]
+    item = a.get("_task")
+    if item:
+        notified = fan_out(scope, item, "commit", a["session"],
+                           f"{sha} on {branch}: {message.splitlines()[0]} ({len(staged)} files)")
+        if notified:
+            out.append(f"\n{len(notified)} subscriber(s) of {item}: {', '.join(notified)}")
+            out.append(spawn_notifier(scope, item, f"new commit {sha} — "
+                                      f"{message.splitlines()[0]}", notified, a["session"]))
+    return "\n".join(out)
+
+
 def op_prune(a):
     repo, name = a["repo"], a["worktree"]
     scope = L.scope_of(os.path.join(L.WORKSPACE, repo))
@@ -1128,14 +1419,15 @@ def op_history(a):
         f"  {r['session']}\n      {r['description']}" for r in rows)
 
 
-OPS = {"item_subscribe": op_item_subscribe, "item_unsubscribe": op_item_unsubscribe,
+OPS = {"worktree_commit": op_commit, "notification_relayed": op_notification_relayed, "route_preview": op_route_preview,
+       "item_subscribe": op_item_subscribe, "item_unsubscribe": op_item_unsubscribe,
        "item_update": op_item_update, "notifications_pending": op_notifications_pending,
        "subscriptions": op_subscriptions,
        "expert_list": op_expert_list, "expert_revive": op_expert_revive,
        "doc_review_list": op_doc_review_list, "doc_review_resolve": op_doc_review_resolve,
        "worktree_sync": op_sync, "worktree_adopt": op_adopt, "worktree_create": op_create, "worktree_pull": op_pull, "worktree_merge": op_merge,
        "worktree_prune": op_prune, "worktree_status": op_status, "worktree_history": op_history}
-MUTATING = {"item_subscribe", "item_unsubscribe", "item_update", "expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
+MUTATING = {"worktree_commit", "notification_relayed", "item_subscribe", "item_unsubscribe", "item_update", "expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
 
 
 def require_who(name, args):

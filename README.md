@@ -1,89 +1,152 @@
 # workboard
 
-Coordination tooling for running several agents across several repos.
+Coordination for a workspace where several AI agent sessions work at once.
 
-| part | what it does |
+It solves two things that rot for the same reason — they need attention exactly when you are
+busiest:
+
+- **Worktrees accumulate.** Work finishes, the worktree stays. Nobody remembers who cut it or
+  what it was for, so nobody dares prune it.
+- **Documentation goes stale silently.** A merge changes a mechanism. The pages describing it
+  are still confident and still wrong, and nobody finds out until somebody acts on one.
+
+The fix is the same in both cases: make the moment work moves the moment it gets recorded, and
+put that at a chokepoint nobody can go around.
+
+---
+
+## How it works
+
+Raw `git worktree`, `merge`, `pull`, `branch -d` and `commit` are **blocked in the shell**. They
+go through an MCP server that does the same git work and records **who did it, why, and which
+task it belongs to** — validated *before* anything runs. Read-only git is untouched.
+
+```
+you ──▶ supervisor session ──▶ worktree ──▶ commit ──▶ merge ──▶ prune
+                  │                            │          │
+                  │                            ▼          ▼
+                  │                      subscribers   documentation
+                  │                      notified      review filed
+                  ▼
+             domain experts (long-lived, asked questions, revived when dead)
+```
+
+Every worktree ends the same way — pruned. The only question is whether it merges first, and
+both paths are recorded, so an abandoned experiment is a decision on the record rather than a
+directory nobody will touch.
+
+## What it gives you
+
+### Attribution that cannot be skipped
+
+`session`, `description` and `task` are required on every mutation and checked **before** git
+runs. The task must name a real board item or a tracker issue key — a free-text field decays
+into "misc" within a week, and then the ledger tells you a worktree existed but not what it was
+for.
+
+Everything lands in an append-only `ledger.jsonl`. Nothing is ever rewritten.
+
+### A board that many sessions can write to
+
+`items.json` holds the work; `notes.jsonl` is append-only and open to anyone. Direct edits to
+`items.json` are **blocked** — it changes through `item_update`, which accepts `status`, `owner`,
+`actual`, `fix` and `sev`, and refuses structural fields by name. Structure keeps one writer;
+progress gets many.
+
+### Subscriptions and notifications
+
+Subscribe a session to a board item and it is told when the item moves — on update, and on every
+commit against its task.
+
+Delivery is layered, and the docs are honest about which layer is guaranteed:
+
+| | |
 |---|---|
-| **`worktree-gate/`** | Blocks raw `git worktree` / `merge` / `pull` / `branch -d` from agents and routes them through an MCP server that records **who did it and why** before reporting it done. Worktree ownership becomes *observed* instead of *declared*. |
-| **`board/`** | Turns `items.json` + append-only `notes.jsonl` into a single `WORKBOARD.html` — items, evidence, expected-vs-actual file lists, per-item note logs, a dependency map, and a question queue for the human. |
-| **`vscode-extension/`** | The board inside VS Code: items in an editor panel, Questions / Map / Sessions / Worktrees as collapsible side views you can drag to the right sidebar, clickable file locations, auto-refresh. |
+| every tool result carries what is pending for its caller | **guaranteed** |
+| a cheap headless session relays it to whoever is live | fast, best-effort |
+| `notifications_pending` on demand | guaranteed |
 
-Python 3 and plain JavaScript. **No npm, no TypeScript, no build step, no dependencies.**
+A server cannot interrupt a running session — so it starts one that can. A subscriber it cannot
+reach keeps its notification queued and collects at its next call. Nothing is dropped because a
+session looked absent.
 
-This is a staging ground — these capabilities are headed for the DevSession product
-(`nexus-vcs` working copies + `nexus-track` items). Until then they live here so they can be
-installed on any machine.
+### A documentation loop that files itself
 
-## Install
+A merge captures the diff and the commit subjects **before** merging (afterwards the range is
+empty), then routes the change to whichever documentation project declares coverage of those
+paths, and starts a session there to record it.
+
+Routing is declared, not hardcoded. Each documentation project owns a `coverage.json`:
+
+```jsonc
+{ "project": "fdw-anatomy", "agent": "fdw-anatomy-maintainer", "precedence": 10,
+  "covers":  [{ "repo": "fractaldataworks", "paths": ["public/src/**"] }],
+  "ignores": ["**/*.Tests/**", "**/obj/**"] }
+```
+
+A change **nothing** covers is queued in `_unrouted.jsonl` as a finding — never sent to a
+default project. A subsystem no document covers is exactly the case you most need to see.
+
+The spawned session follows that project's own `CLAUDE.md`, which **outranks** the prompt it was
+given. In a registrar-style corpus it records the claim and marks pages suspect; it does not
+rewrite a page to match a diff.
+
+### Domain experts
+
+A folder holding `.expert.json` and a `CLAUDE.md` is a long-lived expert session — asked
+questions, addressed by name, revived when it dies. `covers` names the code it speaks for, so it
+works with a flat source tree today and collapses to the folder itself when the tree is grouped
+by domain.
+
+### Scopes
+
+A directory containing `.workboard/` is a scope: its own board, journal and worktrees. A nested
+scope governs itself and the parent ignores it entirely — that is how you separate a fork or a
+product line without two boards disagreeing about who owns what.
+
+## Quick start
 
 ```bash
-./install.sh /path/to/workspace --extension
+linux/registrar.sh doctor .           # audit a workspace; exits non-zero if wrong
+linux/registrar.sh init-scope ~/work  # create one
+linux/registrar.sh add-project myrepo --docs my-corpus
+linux/registrar.sh sweep . 30         # loose files, classified with the evidence shown
 ```
 
-Links `.worktree-gate/` and `.workboard/build.py` into the workspace, seeds an `items.json` if
-there isn't one, and (with `--extension`) links the extension into `~/.vscode-server/extensions`
-or `~/.vscode/extensions`.
+Then register the hook and the MCP server — `init-scope` prints both snippets. It never edits
+your configuration for you.
 
-It deliberately **does not** edit your MCP config or your Claude Code hooks — it prints those
-two snippets for you to paste. A tool that silently rewrites your settings is worse than one
-that asks.
+## Two implementations
 
-Then: `python3 <workspace>/.workboard/build.py`
+| | `linux/` (Python 3) | `powershell/` (PowerShell 7+) |
+|---|---|---|
+| gate hook | ~21 ms per call | ~560 ms per call |
+| MCP server | 20 tools | core worktree tools; rest in progress |
+| board builder | yes | yes, byte-comparable output |
 
-## How it hangs together
+The hook fires on **every** shell command, so that 27× gap is real — 300 commands is about three
+minutes of pure latency. **On a machine that has Python, use the Python hook even if the rest of
+your world is PowerShell.** They are separate processes sharing only the ledger file.
+
+**[`SPEC.md`](SPEC.md) is the contract** — ledger format, scope rules, refusal semantics, board
+shapes, expert declaration, delivery guarantees. If the two implementations ever disagree, one of
+them is wrong and `SPEC.md` says which.
+
+## Layout
 
 ```
-   agent runs `git worktree add ...`
-              │
-              ▼
-   gate.py  (PreToolUse hook)  ──► DENIED, and the attempt is recorded
-              │
-              ▼
-   worktree_create(session, description, repo, task)      ← the only sanctioned path
-              │
-              ├─► git, via the same commands a human would run
-              └─► append to <scope>/.worktree-gate/ledger.jsonl
-                              │
-                              ▼
-                     build.py derives ownership ──► WORKBOARD.html
-                              │
-                              ▼
-                     VS Code extension reads the data directly
+SPEC.md              the contract
+linux/               registrar.sh · install.sh · worktree-gate/ · board/
+powershell/          Registrar.ps1 · gate/ · board/
+shared/board/        template.html · items.example.json
+vscode-extension/    board viewer, plain JS, no build step
 ```
-
-Nothing is declared twice. The journal is the record; the board and the extension are views of
-it. There is no `worktrees.json` to maintain and no way for two views to disagree.
-
-## Scope — a `.workboard/` folder defines one
-
-A directory containing `.workboard/` governs itself: its own journal, its own repos, its own
-worktrees. The gate never acts above its workspace root, ignores any nested folder that has its
-own `.workboard/` (and *names* what it ignored rather than silently omitting it), and writes
-each event to the journal of the scope that owns the repo.
-
-Ownership follows the **repo**, not the path — a worktree under `<repo>/.worktrees/` counts the
-same as one under `<workspace>/.worktrees/`, and a repo's own main checkout is never a worktree.
-
-## What the gate refuses
-
-- creating a worktree when the main checkout has uncommitted **tracked** changes
-- merging when the journal has no base branch for that worktree — it says so rather than
-  guessing a target
-- merging when the main checkout is on a different branch than the worktree was cut from
-- pruning with uncommitted or unmerged work, unless forced (and forced is recorded)
-- any mutation with a blank `session` or `description`, checked **before** any git runs
-
-## Read this before changing it
-
-`CLAUDE.md` carries the working rules — one writer per layer, derive rather than store, absence
-is displayed not hidden, and never weaken a refusal to unblock your own work.
 
 ## Status
 
-Working and in daily use, but young. Known rough edges:
+Working: the gate, attribution, task validation, the board with subscriptions and notifications,
+coverage routing, the unrouted queue, documentation review with spawned registrars, domain
+experts.
 
-- The gate refuses on **untracked-only** changes, which `git worktree add` does not care about.
-  Fix is drafted (`--untracked-files=no` for the refusal, untracked reported as a note) and
-  deliberately unapplied — relaxing a guardrail is the operator's call.
-- `board/build.py` renders a fixed layout; the extension is the more flexible view.
-- The extension's activation path has been exercised by hand, not by an automated test.
+In progress: the remaining PowerShell MCP tools. The transport is proven and the gate hook is at
+full parity with Python.

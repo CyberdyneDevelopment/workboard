@@ -30,6 +30,11 @@ GATED = {
     "merge":    (None, "worktree_merge"),
     "pull":     (None, "worktree_pull"),
     "branch":   ({"-d", "-D", "--delete", "-m", "-M", "--move"}, "worktree_prune"),
+    # A commit is the finest-grained signal that work moved, and it was invisible before:
+    # nothing watched worktree HEADs, so a subscriber learned only when a status flipped.
+    # Gating it makes the signal exact rather than inferred. It is also the most frequent
+    # git operation there is, so the friction is real and deliberate.
+    "commit":   (None, "worktree_commit"),
 }
 
 MESSAGE = """Blocked: worktree lifecycle operations go through the worktree-gate MCP server.

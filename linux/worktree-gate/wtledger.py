@@ -162,7 +162,22 @@ def known_repos(scope=None):
     if os.path.isdir(docs):
         repos += [os.path.join("docs", d) for d in os.listdir(docs)
                   if os.path.isdir(os.path.join(docs, d, ".git"))]
-    return sorted(repos)
+    # Dedupe by REAL path. A documentation project may be a symlink into a checkout that also
+    # sits at the scope root -- which is the right way to enumerate one without moving a live
+    # session out from under it. Counted twice, the same repo could take two worktrees under
+    # two names, and status would double-count them.
+    seen, out = {}, []
+    for r in repos:
+        real = os.path.realpath(os.path.join(scope, r))
+        if real in seen:
+            # Prefer the shallower name: the real location, not the alias.
+            if r.count(os.sep) < seen[real].count(os.sep):
+                out[out.index(seen[real])] = r
+                seen[real] = r
+            continue
+        seen[real] = r
+        out.append(r)
+    return sorted(out)
 
 
 def current_branch(path):
