@@ -125,6 +125,20 @@ TOOLS = [
                     "description": "Repo-relative changed paths."},
           "scope": {"type": "string"}},
          ["repo"], mutates=False),
+    tool("item_file",
+         "File a NEW board item. Open to every session: discovering work and curating the board "
+         "are different acts. The orchestrating session may re-group or re-word it afterwards. "
+         "Does not take `task` — the id you give IS the task.",
+         {"id": {"type": "string", "description": "kebab-case slug; also the #anchor and the key notes reference."},
+          "title": {"type": "string"},
+          "why": {"type": "string", "description": "The consequence, not a restatement of the title."},
+          "repo": {"type": "string"},
+          "sev": {"type": "string", "description": "live | high | medium | low | design"},
+          "evidence": {"type": "array", "items": {"type": "string"}},
+          "fix": {"type": "string"},
+          "group": {"type": "string", "description": "Defaults to 'Filed by workers'."},
+          "scope": {"type": "string"}},
+         ["id", "title", "why"]),
     tool("item_subscribe",
          "Subscribe this session to a board item. When anyone updates it you are notified. "
          "Delivery is at your next worktree-gate call -- this server cannot interrupt a "
@@ -928,6 +942,73 @@ def op_notification_relayed(a):
     return f"{len(rows)} notification(s) for {a['subscriber']} on {a['item']} marked relayed."
 
 
+SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def op_item_file(a):
+    """File a NEW board item. Anyone may do this.
+
+    Why creating is not the same act as curating: `worktree_create` refuses a task that is not
+    already an item, and nothing created one, so a session that DISCOVERED work had no way to
+    record it and no way to start on it. Two rules met in a place with no door.
+
+    The invariant "one writer for structure" was never "only one session may add work" -- it
+    exists because several sessions editing one JSON file clobber each other, and going through
+    this tool solves that. Arrangement, links and rewording stay with the orchestrating session
+    (see op_item_update); discovery does not.
+    """
+    scope = _scope_arg(a)
+    item_id = (a.get("id") or "").strip()
+    if not SLUG.match(item_id):
+        raise L.GateError(f"id {item_id!r} must be a kebab-case slug — it is also the item's "
+                          f"#anchor on the page and the key notes reference.")
+    board = board_path(scope)
+    if not os.path.exists(board):
+        raise L.GateError(f"no board at {board}")
+    data = json.load(open(board, encoding="utf-8"))
+    existing = {i["id"] for g in data.get("groups", []) for i in g.get("items", [])}
+    if item_id in existing:
+        raise L.GateError(f"{item_id!r} already exists. Use item_update to change it, or pick "
+                          f"another slug.")
+    for field in ("title", "why"):
+        if not (a.get(field) or "").strip():
+            raise L.GateError(f"{field} is required. An item without it is a slug nobody can act on.")
+
+    group_name = (a.get("group") or "Filed by workers").strip()
+    group = next((g for g in data.setdefault("groups", []) if g.get("name") == group_name), None)
+    if group is None:
+        group = {"name": group_name,
+                 "blurb": "Work discovered by a session while doing something else. The "
+                          "orchestrating session re-groups and re-words these; the finding "
+                          "itself belongs to whoever found it.",
+                 "items": []}
+        data["groups"].insert(0, group)
+
+    item = {"id": item_id, "title": a["title"].strip(), "status": "open",
+            "sev": a.get("sev") or "medium", "why": a["why"].strip(),
+            "filedBy": a["session"], "filedAt": L.now()[:10]}
+    if a.get("repo"):
+        item["repo"] = a["repo"]
+    if a.get("evidence"):
+        item["evidence"] = list(a["evidence"])
+    if a.get("fix"):
+        item["fix"] = a["fix"]
+    group["items"].append(item)
+
+    tmp = board + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as h:
+        json.dump(data, h, indent=1)
+    os.replace(tmp, board)
+
+    L.record("board", a["session"], a["description"], a.get("repo"), None,
+             item=item_id, filed=True, group=group_name, ok=True)
+    return (f"Filed {item_id} in '{group_name}'.\n"
+            f"  {item['title']}\n"
+            f"You can now cut a worktree against it:\n"
+            f"  worktree_create(repo=..., task={item_id!r}, session=..., description=...)\n"
+            f"The orchestrating session may re-group or re-word it; the finding stays yours.")
+
+
 def op_item_update(a):
     scope = _scope_arg(a)
     data, group, item = find_item(scope, a["item"])
@@ -936,10 +1017,24 @@ def op_item_update(a):
         raise L.GateError("changes is empty. Say what you are changing.")
     bad = set(changes) - WORKER_FIELDS
     if bad:
-        why = ("structure belongs to the orchestrating session"
-               if bad & STRUCTURE_FIELDS else "not a known item field")
-        raise L.GateError(f"cannot set {', '.join(sorted(bad))} — {why}. "
-                          f"Settable here: {', '.join(sorted(WORKER_FIELDS))}.")
+        unknown = bad - STRUCTURE_FIELDS
+        if unknown:
+            raise L.GateError(f"cannot set {', '.join(sorted(unknown))} — not a known item "
+                              f"field. Settable: {', '.join(sorted(WORKER_FIELDS))}.")
+        # Structure is the orchestrating session's, and WHO that is comes from configuration --
+        # not from the caller asserting it. A flag anyone can pass is a comment, not a control.
+        boss = supervisor_of(scope)
+        if not boss:
+            raise L.GateError(
+                f"cannot set {', '.join(sorted(bad))} — those belong to the orchestrating "
+                f"session, and no supervisor is nominated in {os.path.join(scope, '.registrar.json')}. "
+                f"Nominate one, or change only: {', '.join(sorted(WORKER_FIELDS))}.")
+        if a["session"] != boss:
+            raise L.GateError(
+                f"cannot set {', '.join(sorted(bad))} — structure belongs to {boss!r}, the "
+                f"nominated orchestrating session. You are {a['session']!r}.\n"
+                f"Settable by anyone: {', '.join(sorted(WORKER_FIELDS))}.\n"
+                f"To FILE new work instead, use item_file — that is open to everyone.")
 
     before = {k: item.get(k) for k in changes}
     item.update(changes)
@@ -1442,7 +1537,7 @@ def op_history(a):
         f"  {r['session']}\n      {r['description']}" for r in rows)
 
 
-OPS = {"worktree_commit": op_commit, "notification_relayed": op_notification_relayed, "route_preview": op_route_preview,
+OPS = {"item_file": op_item_file, "worktree_commit": op_commit, "notification_relayed": op_notification_relayed, "route_preview": op_route_preview,
        "item_subscribe": op_item_subscribe, "item_unsubscribe": op_item_unsubscribe,
        "item_update": op_item_update, "notifications_pending": op_notifications_pending,
        "subscriptions": op_subscriptions,
@@ -1450,7 +1545,7 @@ OPS = {"worktree_commit": op_commit, "notification_relayed": op_notification_rel
        "doc_review_list": op_doc_review_list, "doc_review_resolve": op_doc_review_resolve,
        "worktree_sync": op_sync, "worktree_adopt": op_adopt, "worktree_create": op_create, "worktree_pull": op_pull, "worktree_merge": op_merge,
        "worktree_prune": op_prune, "worktree_status": op_status, "worktree_history": op_history}
-MUTATING = {"worktree_commit", "notification_relayed", "item_subscribe", "item_unsubscribe", "item_update", "expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
+MUTATING = {"item_file", "worktree_commit", "notification_relayed", "item_subscribe", "item_unsubscribe", "item_update", "expert_revive", "doc_review_resolve", "worktree_sync", "worktree_adopt", "worktree_create", "worktree_pull", "worktree_merge", "worktree_prune"}
 
 
 def require_who(name, args):
@@ -1462,7 +1557,10 @@ def require_who(name, args):
     precondition, not a post-condition."""
     if name not in MUTATING:
         return
-    for field in ("session", "description", "task"):
+    # item_file CREATES the item a task would name, so it cannot be validated against the
+    # board -- requiring one would be the same closed door this tool exists to open.
+    fields = ("session", "description") if name == "item_file" else ("session", "description", "task")
+    for field in fields:
         if not (args.get(field) or "").strip():
             raise L.GateError(
                 f"{field} is required before {name} will touch anything — "
@@ -1472,6 +1570,9 @@ def require_who(name, args):
     # against the WORKSPACE board instead of the sub-scope's, so a legitimate task in a nested
     # scope was refused while naming items from a board the caller was not using.
     scope = _scope_arg(args)
+    if name == "item_file":
+        args["_scope"] = scope
+        return
     task, board, verified = resolve_task(scope, args["task"])
     args["_task"], args["_verified"] = task, verified
     args["_board"] = os.path.relpath(board, L.WORKSPACE) if board else None

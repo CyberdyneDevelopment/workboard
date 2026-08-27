@@ -166,6 +166,30 @@ An implementation must:
 `Write`/`Edit`/`MultiEdit` on it. `notes.jsonl` is deliberately not guarded: it is append-only
 and anyone may add to it.
 
+Creating an item and curating the board are **different acts**, and only the second has one
+writer.
+
+| tool | who | what |
+|---|---|---|
+| `item_file` | anyone | file a NEW item — id, title, why, repo, sev, evidence, fix |
+| `item_update` worker fields | anyone | `status` `owner` `actual` `fix` `sev` |
+| `item_update` structural fields | the nominated supervisor only | `id` `title` `why` `evidence` `links` `expected` `repo` `was` |
+
+**Why `item_file` is open to everyone.** A gate that refuses a task which is not already an item,
+combined with no tool that creates one, is two rules meeting in a place with no door: a session
+that *discovers* work can neither record it nor start on it. The "one writer" invariant was never
+"only one session may add work" — it exists because several sessions editing one JSON file clobber
+each other, and routing through the server solves that. Arrangement, wording and links stay with
+the orchestrating session; discovery does not.
+
+`item_file` does **not** take `task`: the id it creates *is* the task. Requiring one would be the
+same closed door.
+
+**Who the orchestrating session is comes from configuration**, not from the caller asserting it —
+`supervisor.name` in the scope's `.registrar.json`. A flag any caller can pass is a comment, not a
+control. With no supervisor nominated, structural fields are refused outright rather than opened
+to everyone.
+
 `item_update` accepts only these fields:
 
 | settable by a worker | belongs to the orchestrating session |
