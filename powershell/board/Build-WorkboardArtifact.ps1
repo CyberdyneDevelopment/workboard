@@ -41,6 +41,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+function Find-Template {
+    # The template is language-neutral and lives in shared/, but this script has moved
+    # between layouts. Try the places it legitimately sits, then say what was tried.
+    $candidates = @(
+        (Join-Path $Here 'template.html'),
+        (Join-Path $Here '..\..\shared\board\template.html'),
+        (Join-Path $Here '..\shared\board\template.html')
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c -PathType Leaf) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    throw ("cannot find template.html. Tried:`n  " + ($candidates -join "`n  "))
+}
 $SevLabel = @{ live = 'live bug'; high = 'high'; medium = 'medium'; low = 'low';
     design = 'decision'; done = 'shipped' }
 
@@ -338,7 +352,7 @@ $Footer = "$($AllItems.Count) items$($sep)$noteCount notes$($sep)$($Questions.Co
     'Regenerate and republish to the same URL to update in place. ' +
     'Worktrees are a snapshot: an artifact cannot run git.'
 
-$tpl = Get-Content -LiteralPath (Join-Path $Here 'template.html') -Raw -Encoding UTF8
+$tpl = Get-Content -LiteralPath (Find-Template) -Raw -Encoding UTF8
 $title = ConvertTo-HtmlText (Get-Prop $Data 'title' 'Workboard')
 $subtitle = ConvertTo-HtmlText (Get-Prop $Data 'subtitle' `
         'What is open, the evidence, who holds it, and what they have found.')

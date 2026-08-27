@@ -23,6 +23,22 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+
+def find_template():
+    """The template is language-neutral and lives in shared/, but this script has moved
+    between layouts. Try the places it legitimately sits, then say what was tried."""
+    candidates = [
+        os.path.join(HERE, "template.html"),                                  # beside the script
+        os.path.join(HERE, "..", "..", "shared", "board", "template.html"),   # public/<lang>/board
+        os.path.join(HERE, "..", "shared", "board", "template.html"),
+    ]
+    for c in candidates:
+        c = os.path.normpath(c)
+        if os.path.isfile(c):
+            return c
+    raise SystemExit("cannot find template.html. Tried:\n  "
+                     + "\n  ".join(os.path.normpath(c) for c in candidates))
+
 SEV = {"live": "live bug", "high": "high", "medium": "medium", "low": "low",
        "design": "decision", "done": "shipped"}
 
@@ -231,7 +247,7 @@ def render(data, notes, trees, stamp):
               'Regenerate and republish to the same URL to update in place. '
               'Worktrees are a snapshot: an artifact cannot run git.')
 
-    with open(os.path.join(HERE, "template.html"), encoding="utf-8") as fh:
+    with open(find_template(), encoding="utf-8") as fh:
         tpl = fh.read()
     for token, value in (("TITLE", esc(data.get("title", "Workboard"))),
                          ("SUBTITLE", esc(data.get("subtitle",
