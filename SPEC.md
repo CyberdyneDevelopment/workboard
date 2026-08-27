@@ -9,7 +9,25 @@ board built by one and a ledger written by the other must be interchangeable.
 
 ---
 
-## 1. Scope — a `.workboard/` folder defines one
+## 1. Installation and workspaces — one install, many locations
+
+**A workspace is defined by the marker on disk, not by where the gate is installed.** The
+outermost directory containing `.workboard/`, walking up from the caller's location and bounded
+at `$HOME`, is the workspace. One installation therefore governs any number of workspaces, and
+each keeps its own board and its own journal.
+
+Resolution order, with no fallback:
+
+1. `WORKTREE_GATE_WORKSPACE` — an explicit override.
+2. The workspace of the caller's location.
+
+The install path is deliberately **not** consulted. Deriving the workspace from where the code
+lives is what ties one install to one tree.
+
+Outside any workspace the gate returns **no decision** — not an error, and not a guess at a
+boundary. It simply has no business there.
+
+## 11. Scope — a `.workboard/` folder defines one
 
 A directory containing `.workboard/` **is a scope**. It governs itself: its own journal, its own
 repos, its own worktrees.

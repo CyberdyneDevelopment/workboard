@@ -12,8 +12,8 @@ import subprocess
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
 # The outermost scope: where the gate is installed. Nothing above this is ever touched.
-WORKSPACE = os.path.dirname(HERE)
 
 # A directory containing .workboard/ IS a scope. It governs itself: its own journal, its
 # own repos, its own worktrees. The scope that contains it must ignore it entirely --
@@ -25,21 +25,53 @@ def is_scope(path):
     return os.path.isdir(os.path.join(path, SCOPE_MARKER))
 
 
+def workspace_of(path):
+    """The OUTERMOST directory containing .workboard, walking up from `path`, bounded at $HOME.
+
+    This is what lets ONE installation serve every location instead of only the tree it happens
+    to sit in. A workspace is defined by the marker on disk, not by where the gate is installed,
+    so the same binary governs any number of workspaces and each keeps its own board and its own
+    journal.
+
+    Outermost, not nearest: the nearest .workboard is the SCOPE (a sub-scope governs itself);
+    the outermost is the workspace, which bounds the walk and roots relative paths. Both
+    behaviours are preserved -- only the source of the boundary changes.
+
+    Returns None outside any workspace. That is not a failure: the gate simply has no business
+    there and says so, rather than guessing a boundary.
+    """
+    found, p = None, os.path.abspath(path)
+    while p.startswith(HOME) and p != HOME and p != os.path.dirname(p):
+        if is_scope(p):
+            found = p
+        p = os.path.dirname(p)
+    return found
+
+
+# Resolution order, no fallback: an explicit override, then the caller's location. The install
+# path is deliberately NOT consulted -- deriving the workspace from where the code lives is the
+# thing that tied one install to one tree.
+WORKSPACE = os.environ.get("WORKTREE_GATE_WORKSPACE") or workspace_of(os.getcwd())
+
 def scope_of(path):
-    """Nearest enclosing scope for a path, bounded at WORKSPACE. Never returns a
-    directory above the workspace root."""
+    """Nearest enclosing scope for a path, bounded at that path's own workspace.
+
+    The bound comes from the location, not from where the gate is installed, so one
+    installation governs any number of workspaces and each keeps its own board and journal."""
     path = os.path.abspath(path)
-    if not (path == WORKSPACE or path.startswith(WORKSPACE + os.sep)):
-        raise GateError(f"{path} is outside the workspace ({WORKSPACE}). The gate does not "
-                        f"act on anything above its own workspace root.")
-    while path != WORKSPACE:
+    bound = WORKSPACE if WORKSPACE and (path == WORKSPACE or path.startswith(WORKSPACE + os.sep)) \
+        else workspace_of(path)
+    if bound is None:
+        raise GateError(f"{path} is not inside any workspace — no .workboard was found above it. "
+                        f"The gate acts only inside a workspace.")
+    while path != bound:
         if is_scope(path):
             return path
         parent = os.path.dirname(path)
         if parent == path:
             break
         path = parent
-    return WORKSPACE
+    return bound
 
 
 def ledger_of(scope):

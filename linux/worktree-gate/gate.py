@@ -15,7 +15,10 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+# The gate's own location says nothing about which workspace a call belongs to. One install
+# serves every workspace; the boundary comes from the caller's cwd. SELF is kept only so the
+# denial text can name the server's real path.
+SELF = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 # Shell words that wrap another command; look past them for the real verb.
@@ -85,7 +88,7 @@ def board_write_denial(payload):
         "resolves\nits MCP tools at startup, so one started before these tools existed cannot "
         "see them.\nUse the recorded CLI instead — same validation, same ledger, same "
         "notifications:\n\n"
-        f"  python3 {os.path.join(ROOT, '.worktree-gate/server.py')} call item_update \\\n"
+        f"  python3 {os.path.join(HERE, 'server.py')} call item_update \\\n"
         "    '{\"item\":\"<slug>\",\"changes\":{\"status\":\"done\"},"
         "\"session\":\"<you>\",\"description\":\"<why>\",\"task\":\"<slug>\"}'\n\n"
         "It validates the item exists, refuses fields that belong to the orchestrating\n"
@@ -184,7 +187,7 @@ def record_created(payload):
 
     cwd = payload.get("cwd") or ""
     try:
-        scope = L.scope_of(cwd) if cwd.startswith(ROOT) else L.WORKSPACE
+        scope = L.scope_of(cwd)
     except L.GateError:
         scope = L.WORKSPACE
 
@@ -234,7 +237,15 @@ def main():
     command = (payload.get("tool_input") or {}).get("command") or ""
     cwd = payload.get("cwd") or ""
     # Why: the gate never acts above its own workspace. Anything outside keeps normal git.
-    if not (cwd.startswith(ROOT) or ROOT in command):
+    # In a workspace? Otherwise this call is none of the gate's business.
+    # Imported here and guarded: a hook that raises is worse than one that declines to decide,
+    # so any failure to resolve a workspace means no decision rather than a crash.
+    try:
+        import wtledger as L
+        workspace = L.workspace_of(cwd)
+    except Exception:  # noqa: BLE001 - never let the hook take down the tool call
+        sys.exit(1)
+    if workspace is None:
         sys.exit(1)
 
     for segment in segments(command):
@@ -248,7 +259,7 @@ def main():
             # with its own .workboard keeps its own journal; writing into a parent's
             # would put one scope's events on another scope's board.
             try:
-                scope = L.scope_of(cwd) if cwd.startswith(ROOT) else L.WORKSPACE
+                scope = L.scope_of(cwd)
             except L.GateError:
                 scope = L.WORKSPACE
             L.append({"ts": L.now(), "action": "denied",
@@ -263,7 +274,7 @@ def main():
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": MESSAGE.format(
-                cmd=segment.strip()[:200], tool=tool.split(" / ")[0], root=ROOT),
+                cmd=segment.strip()[:200], tool=tool.split(" / ")[0], root=workspace),
         }}))
         sys.exit(0)
     sys.exit(1)
